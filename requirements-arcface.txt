@@ -1,0 +1,2 @@
+# CPU inference. For NVIDIA CUDA, install the matching onnxruntime-gpu build instead.
+onnxruntime>=1.17

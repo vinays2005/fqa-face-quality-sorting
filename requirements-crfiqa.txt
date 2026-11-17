@@ -1,0 +1,5 @@
+# Optional: install only when using a compatible CR-FIQA TorchScript model.
+# Select the PyTorch wheel matching your installed CUDA/driver from:
+# https://pytorch.org/get-started/locally/
+torch>=2.1
+torchvision>=0.16
