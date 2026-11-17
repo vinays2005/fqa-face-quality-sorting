@@ -5,6 +5,101 @@ and ArcFace clustering. Detects faces? No — consumes them. Extracts metrics
 once, then reclassifies instantly under different threshold configs without
 re-running any model.
 
+## Quick start (Windows, Git Bash)
+
+```bash
+cd FQA_Face_Quality_Sorting_System
+
+# 1. Environment
+python -m venv .venv
+source .venv/Scripts/activate
+pip install -r requirements.txt
+
+# 2. Model weights (not bundled — see docs/MODELS.md)
+mkdir -p models
+curl -L -o models/face_landmarker.task \
+  https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task
+
+# 3. Build a manifest from a folder of images.
+#    Handles BOTH a folder of separate single-face images AND montage/contact-sheet
+#    pages that tile several pre-cropped faces into one image on a uniform grid
+#    (it auto-detects which case each file is — see tools/images_to_manifest.py).
+python tools/images_to_manifest.py \
+  --input-dir images \
+  --out cache/manifest.jsonl
+
+# 4. Extract metrics ONCE (slow — runs MediaPipe on every face)
+python -m fqa.inference \
+  --manifest cache/manifest.jsonl \
+  --config config/balanced.json \
+  --landmarker models/face_landmarker.task \
+  --out cache/metrics.jsonl
+# Copy the "inference_fingerprint=..." value it prints — you need it next.
+
+# 5. Classify + export (fast — pure arithmetic, re-run freely with any config)
+python -m fqa.reclassify \
+  --metrics cache/metrics.jsonl \
+  --cache-fingerprint <PASTE_FINGERPRINT_HERE> \
+  --config config/balanced.json \
+  --out output/quality_report
+
+# 6. Dashboard — tune thresholds live without re-running inference
+export FQA_METRICS=cache/metrics.jsonl
+export FQA_CONFIG=config/balanced.json
+python -m uvicorn fqa.dashboard:app --host 127.0.0.1 --port 8000
+# open http://127.0.0.1:8000
+```
+
+Step 5 is the one you re-run every time you just want to try different
+thresholds — it only needs step 4's `metrics.jsonl` and a `--cache-fingerprint`
+that matches it. Only re-run step 4 if you change a setting that affects what
+gets *measured* (`detector`, `min_det_confidence`, `use_mediapipe`,
+`use_crfiqa`, `use_grayscale` — see table below).
+
+## Editing thresholds
+
+Three ways, same underlying `ScoringConfig` JSON (see `config/*.json`):
+
+1. **Dashboard** (easiest): run step 6 above, drag sliders, click
+   "Apply to current metrics" to instantly see new GOOD/REVIEW/BAD counts,
+   then "Save configuration" to write it back to the config file.
+2. **Edit the JSON directly**: open any file in `config/` and change a number,
+   then re-run step 5 pointing `--config` at it.
+3. **Copy a preset**: `config/balanced.json` / `strict.json` / `relaxed.json`
+   are starting points at different strictness levels — copy one, tweak it,
+   point `--config` at your copy.
+
+### What each threshold does
+
+| Field | Meaning | Raise it to... | Lower it to... |
+|---|---|---|---|
+| `good_threshold` | Minimum weighted score (0–100) to classify a face GOOD. | Accept fewer, higher-quality faces. | Accept more faces as GOOD. |
+| `review_threshold` | Minimum score to be REVIEW instead of BAD. | Send more borderline faces to BAD instead of REVIEW. | Rescue more low-scoring faces into REVIEW instead of BAD. |
+| `weights.*` (`visibility`, `completeness`, `sharpness`, `pose`, `occlusion`, `resolution`) | How much each sub-score contributes to the final weighted score. Must sum > 0. | Make that signal matter more to the final decision. | Make that signal matter less (set to `0` to ignore it entirely — e.g. when MediaPipe isn't available, so pose/visibility/occlusion can't be measured). |
+| `min_visibility` | Minimum visibility sub-score (0–100, from MediaPipe landmark/region detection) before `visibility_below_min` fires. | Demand more of the face be clearly visible. | Tolerate more of the face being hidden/unclear. |
+| `minimum_sharpness` | Blur floor (Laplacian-variance based). Below this, `blur_below_min` fires (hard reject by default). | Reject blurrier faces. | Allow blurrier faces through. |
+| `sharpness_full_score` | Sharpness value that maps to a perfect 100 sub-score. | Make it harder to earn full sharpness credit. | Make it easier to earn full sharpness credit. |
+| `max_yaw` / `max_pitch` / `max_roll` | Max allowed head rotation in degrees (left-right / up-down / tilt) before `pose_exceeded` fires. | Only accept more front-facing faces. | Tolerate more extreme head angles. |
+| `min_face_width` / `min_face_height` | Minimum face crop size in pixels before `resolution_below_min` fires. | Reject smaller/more distant faces. | Accept smaller faces. |
+| `resolution_full_at` | Face size (px) that earns a perfect resolution sub-score. | Demand bigger faces for full credit. | Easier to earn full resolution credit. |
+| `max_occlusion` | Max fraction (0–1) of facial regions allowed to be covered/occluded before `severe_occlusion` fires. | Reject more occluded faces (masks, hands, hair). | Tolerate more occlusion. |
+| `min_brightness` / `max_brightness` | Valid mean-brightness range (0–255) before `too_dark`/`too_bright` fire. | Narrow the acceptable lighting range. | Tolerate darker/brighter images. |
+| `min_contrast` | Minimum contrast before `low_contrast` fires. | Reject flatter/washed-out images. | Tolerate lower contrast. |
+| `max_boundary_clip` | Max fraction of the face bounding box allowed to be clipped by the image edge. | Reject more edge-cropped faces. | Tolerate faces cut off at the frame edge. |
+| `min_det_confidence` | Minimum detector confidence before `detection_confidence_low` fires. | Trust only higher-confidence detections. | Accept lower-confidence detections. |
+| `crfiqa_weight` | How much the optional CR-FIQA score contributes (0 disables it). | Weight CR-FIQA's opinion more. | Ignore CR-FIQA. |
+| `rules.*` | Per-check behavior: `"off"` (ignore), `"review"` (downgrade to REVIEW), or `"reject"` (hard BAD) for each named check (`blur_below_min`, `pose_exceeded`, `severe_occlusion`, `multiple_essential_regions_missing`, `landmarks_failed`, etc). | Set to `"reject"` to make that check disqualifying. | Set to `"review"` or `"off"` to soften/ignore it — e.g. `severe_occlusion: "review"` if your images have overlay text/markers that the occlusion heuristic mistakes for real occlusion. |
+| `use_mediapipe` | Whether to run MediaPipe landmarks at all (needed for visibility/pose/occlusion). **Inference-affecting** — requires re-running step 4. | — | Turn off if MediaPipe can't run in your environment; zero out `visibility`/`pose`/`occlusion` weights and relax their rules to compensate (see `config/demo_relaxed.json`). |
+| `use_grayscale` | Flattens color before sharpness/brightness/contrast measurement only (landmarks/occlusion still use color). **Inference-affecting.** | — | Use when source images have colored overlays/annotations that would otherwise skew sharpness or lighting scores. |
+| `detector` / `min_det_confidence` | Which upstream face detector produced the manifest, and its confidence floor. **Inference-affecting.** | | |
+
+`good_threshold`, `review_threshold`, and every `rules.*`/weight value take
+effect immediately on the next reclassify (step 5) — no need to re-run
+inference. Fields marked **inference-affecting** change what gets measured,
+not just how it's scored, so the cache fingerprint changes and you must
+re-run step 4 first; `fqa.reclassify` will refuse a stale cache and tell you
+so if you forget.
+
 Quick start (Windows PowerShell)
 powershell
 # 1. Environment
